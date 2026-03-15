@@ -29,32 +29,93 @@ if "spx_ndx_market_ids" not in st.session_state:
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 DATA_API_TRADES_URL = "https://data-api.polymarket.com/trades"
-# 关键词（不区分大小写）：匹配标题/描述中含以下任一词的市场
 INDEX_KEYWORDS = [
-    "s&p 500", "s&p500", "nasdaq", "spx", "ndx",
+    "s&p 500", "s&p500", "s\u0026p 500", "s\u0026p500",
+    "nasdaq", "spx", "ndx",
     "s and p 500", "standard and poor", "stock index", "market index",
 ]
 PROFILE_BASE = "https://polymarket.com/profile/"
 
+# 已知的 SPX/NDX 相关 event slug（Polymarket 对 restricted 市场不会在通用列表中返回，需要按 slug 精确获取）
+KNOWN_INDEX_EVENT_SLUGS = [
+    "spx-hit-jun-2026",
+    "spx-close-dec-2026",
+    "sp-500-performance-in-q1",
+    "spx-hit-dec-2026",
+    "bitcoin-vs-gold-vs-sp-500-in-2026",
+    "sp-500-performance-in-q2",
+    "sp-500-performance-in-q3",
+    "sp-500-performance-in-q4",
+    "nasdaq-100-hit-2026",
+    "ndx-close-dec-2026",
+]
+# Polymarket 的 tag_id: "S&P 500" = 102849, "Indicies" = 102682, "Finance" = 120
+INDEX_TAG_IDS = ["102849", "102682"]
+
 
 def _market_matches_index_keywords(m):
-    """判断市场标题/描述是否包含指数相关关键词"""
     q = (m.get("question") or m.get("title") or "").lower()
     desc = (m.get("description") or "").lower()
     text = f"{q} {desc}"
     return any(kw in text for kw in INDEX_KEYWORDS)
 
 
+def _extract_markets_from_event(ev, out_by_cid):
+    """从一个 event dict 中提取所有 market 的 conditionId"""
+    title = (ev.get("title") or ev.get("question") or "")[:80]
+    markets_in = ev.get("markets") or []
+    if isinstance(markets_in, list) and markets_in:
+        for mk in markets_in:
+            cid = mk.get("conditionId") if isinstance(mk, dict) else None
+            q = (mk.get("question") or title)[:80] if isinstance(mk, dict) else title
+            if cid and cid not in out_by_cid:
+                out_by_cid[cid] = {"id": mk.get("id") or ev.get("id"), "conditionId": cid, "question": q}
+    else:
+        cid = ev.get("conditionId")
+        if cid and cid not in out_by_cid:
+            out_by_cid[cid] = {"id": ev.get("id"), "conditionId": cid, "question": title}
+
+
 # --- 2. 第一步：定位市场 ---
 @st.cache_data(ttl=300)
 def fetch_index_markets():
     """
-    从 Gamma API 拉取与 SPX/NDX 相关的市场（优先活跃，无活跃时含近期有交易的市场）。
-    先请求 /events（活跃），再请求 /markets（不限 closed），合并并去重。
+    三种策略拉取 SPX/NDX 相关市场：
+    1. 按已知 event slug 精确获取（解决 restricted 市场不出现在通用列表中的问题）
+    2. 按 tag_id (S&P 500, Indicies) 搜索
+    3. 通用列表 + 关键词匹配（兜底）
     """
-    out_by_cid = {}  # conditionId -> info，用于去重
+    out_by_cid = {}
 
-    # 策略 1：拉取活跃 events，从中提取 markets（含 conditionId）
+    # 策略 1：按已知 slug 精确获取
+    for slug in KNOWN_INDEX_EVENT_SLUGS:
+        try:
+            r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=10)
+            r.raise_for_status()
+            events = r.json()
+            if isinstance(events, list):
+                for ev in events:
+                    _extract_markets_from_event(ev, out_by_cid)
+        except Exception:
+            pass
+
+    # 策略 2：按 tag_id 搜索
+    for tag_id in INDEX_TAG_IDS:
+        try:
+            r = requests.get(
+                GAMMA_EVENTS_URL,
+                params={"tag_id": tag_id, "limit": 100, "closed": "false"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            events = r.json()
+            if isinstance(events, list):
+                for ev in events:
+                    _extract_markets_from_event(ev, out_by_cid)
+        except Exception:
+            pass
+
+    # 策略 3：通用列表 + 关键词匹配
     try:
         r = requests.get(
             GAMMA_EVENTS_URL,
@@ -65,44 +126,10 @@ def fetch_index_markets():
         events = r.json()
         if isinstance(events, list):
             for ev in events:
-                if not _market_matches_index_keywords(ev):
-                    continue
-                # events 可能内嵌 markets 或单个 conditionId
-                markets_in = ev.get("markets") or []
-                if isinstance(markets_in, list) and markets_in:
-                    for mk in markets_in:
-                        cid = mk.get("conditionId") if isinstance(mk, dict) else None
-                        if cid and cid not in out_by_cid:
-                            out_by_cid[cid] = {"id": mk.get("id") or ev.get("id"), "conditionId": cid, "question": (ev.get("title") or ev.get("question") or "")[:80]}
-                else:
-                    cid = ev.get("conditionId")
-                    if cid and cid not in out_by_cid:
-                        out_by_cid[cid] = {"id": ev.get("id"), "conditionId": cid, "question": (ev.get("title") or ev.get("question") or "")[:80]}
-    except Exception as e:
-        st.warning(f"拉取 events 时出错（将仅用 markets）: {e}")
-
-    # 策略 2：拉取 markets（不传 closed，以拿到更多结果），按关键词筛选；多页以增加命中率
-    for offset in (0, 500):
-        try:
-            r = requests.get(
-                GAMMA_MARKETS_URL,
-                params={"limit": 500, "offset": offset},
-                timeout=15,
-            )
-            r.raise_for_status()
-            markets = r.json()
-            if not isinstance(markets, list) or not markets:
-                break
-            for m in markets:
-                if not _market_matches_index_keywords(m):
-                    continue
-                cid = m.get("conditionId")
-                if cid and cid not in out_by_cid:
-                    out_by_cid[cid] = {"id": m.get("id"), "conditionId": cid, "question": (m.get("question") or m.get("title") or "")[:80]}
-        except Exception as e:
-            if offset == 0:
-                st.error(f"拉取 markets 失败: {e}")
-            break
+                if _market_matches_index_keywords(ev):
+                    _extract_markets_from_event(ev, out_by_cid)
+    except Exception:
+        pass
 
     return list(out_by_cid.values())
 
