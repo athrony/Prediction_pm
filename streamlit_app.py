@@ -108,6 +108,12 @@ def fetch_index_markets():
 
 
 # --- 3. 第二步：提取地址 ---
+def _trade_is_index_related(t):
+    """判断一笔成交是否与 SPX/NDX 指数相关（按标题/slug 匹配关键词）"""
+    title = (t.get("title") or t.get("slug") or "").lower()
+    return any(kw in title for kw in INDEX_KEYWORDS)
+
+
 def _normalize_ts(ts):
     """API 可能返回秒或毫秒，统一为秒"""
     if not ts:
@@ -117,29 +123,36 @@ def _normalize_ts(ts):
 
 def fetch_trades_for_markets(condition_ids, since_ts):
     """
-    拉取交易并提取用户地址。优先按 market(conditionId) 拉取；若无结果则拉取全平台近期成交再按 conditionId 过滤；
-    若仍无则返回全平台近期交易地址。
-    返回 (addresses_set, used_platform_fallback: bool)。
+    拉取 SPX/NDX 相关交易并提取用户地址。
+    策略 1：按 market(conditionId) 精确拉取。
+    策略 2：拉取全平台近期成交，按 conditionId 或标题关键词双重匹配。
+    绝不返回与 SPX/NDX 无关的用户。
     """
     if not condition_ids:
-        return set(), False
+        return set()
     condition_set = set(condition_ids)
     addresses = set()
 
-    def parse_trades(trades, filter_by_cid=True):
+    def _is_index_trade(t):
+        cid = (t.get("conditionId") or "").strip()
+        if cid in condition_set:
+            return True
+        return _trade_is_index_related(t)
+
+    def parse_trades(trades):
         out = set()
         for t in trades:
             ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
             if ts < since_ts:
                 continue
-            if filter_by_cid and (t.get("conditionId") or "").strip() not in condition_set:
+            if not _is_index_trade(t):
                 continue
             addr = (t.get("proxyWallet") or t.get("user") or t.get("owner") or "").strip()
             if addr and isinstance(addr, str) and addr.startswith("0x"):
                 out.add(addr)
         return out
 
-    # 策略 1：按 market 拉取（每次最多 5 个 conditionId，避免 URL 过长）
+    # 策略 1：按 market(conditionId) 精确拉取
     for i in range(0, min(len(condition_ids), 25), 5):
         chunk = condition_ids[i : i + 5]
         market_param = ",".join(chunk)
@@ -152,37 +165,29 @@ def fetch_trades_for_markets(condition_ids, since_ts):
             r.raise_for_status()
             trades = r.json()
             if isinstance(trades, list):
-                addresses |= parse_trades(trades, filter_by_cid=True)
+                addresses |= parse_trades(trades)
         except Exception:
             pass
 
     if addresses:
-        return addresses, False
+        return addresses
 
-    # 策略 2：不按 market 拉取，取近期全平台成交再按 conditionId 过滤
-    try:
-        r = requests.get(DATA_API_TRADES_URL, params={"limit": 10000}, timeout=25)
-        r.raise_for_status()
-        trades = r.json()
-        if isinstance(trades, list):
-            addresses = parse_trades(trades, filter_by_cid=True)
-    except Exception:
-        pass
+    # 策略 2：拉取全平台近期成交，按 conditionId 或标题关键词匹配 SPX/NDX
+    for offset in (0, 5000):
+        try:
+            r = requests.get(
+                DATA_API_TRADES_URL,
+                params={"limit": 5000, "offset": offset},
+                timeout=25,
+            )
+            r.raise_for_status()
+            trades = r.json()
+            if isinstance(trades, list):
+                addresses |= parse_trades(trades)
+        except Exception:
+            break
 
-    if addresses:
-        return addresses, False
-
-    # 策略 3：仍无则用全平台近期交易地址（不按 conditionId 过滤）
-    try:
-        r = requests.get(DATA_API_TRADES_URL, params={"limit": 10000}, timeout=25)
-        r.raise_for_status()
-        trades = r.json()
-        if isinstance(trades, list):
-            addresses = parse_trades(trades, filter_by_cid=False)
-    except Exception:
-        pass
-
-    return addresses, True
+    return addresses
 
 
 # --- 4. 第三步：深度评分（你的公式）---
@@ -239,12 +244,6 @@ def build_traders_df(addresses, metrics_map):
             "ProfitFactor": round(m.get("profit_factor", 0), 3),
         })
     return pd.DataFrame(rows).sort_values("Score", ascending=False)
-
-
-def _trade_is_index_related(t):
-    """判断一笔成交是否与 SPX/NDX 指数相关（按标题/slug 匹配关键词）"""
-    title = (t.get("title") or t.get("slug") or "").lower()
-    return any(kw in title for kw in INDEX_KEYWORDS)
 
 
 def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_ts):
@@ -310,8 +309,6 @@ scan_range_label = st.sidebar.radio(
 # 初始化扫描结果缓存
 if "scan_df" not in st.session_state:
     st.session_state.scan_df = None
-if "scan_fallback" not in st.session_state:
-    st.session_state.scan_fallback = False
 if "scan_market_count" not in st.session_state:
     st.session_state.scan_market_count = 0
 if "scan_addr_count" not in st.session_state:
@@ -336,13 +333,15 @@ if do_scan:
     delta = SCAN_RANGE_OPTIONS.get(scan_range_label, timedelta(hours=24))
     since_ts = int((datetime.now(timezone.utc) - delta).timestamp())
     with st.spinner(f"第二步：提取{scan_range_label}交易用户地址..."):
-        all_addresses, used_platform_fallback = fetch_trades_for_markets(condition_ids, since_ts)
+        all_addresses = fetch_trades_for_markets(condition_ids, since_ts)
     if not all_addresses:
-        st.warning(f"{scan_range_label}内无交易流水，无法提取地址。请稍后重试。")
+        st.warning(
+            f"{scan_range_label}内未找到 SPX/NDX 相关交易者。"
+            "当前 Polymarket 上可能暂无此类市场的活跃成交，请稍后重试。"
+        )
         st.session_state.scan_df = None
         st.stop()
     st.session_state.scan_addr_count = len(all_addresses)
-    st.session_state.scan_fallback = used_platform_fallback
 
     with st.spinner("第三步：批量性能查询与深度评分..."):
         metrics_map = get_address_metrics(list(all_addresses))
@@ -350,9 +349,7 @@ if do_scan:
     st.session_state.scan_df = df_traders
 
 if st.session_state.scan_df is not None:
-    st.success(f"找到 {st.session_state.scan_market_count} 个相关市场 · 去重后得到 {st.session_state.scan_addr_count} 个地址")
-    if st.session_state.scan_fallback:
-        st.info("未在 SPX/NDX 相关市场中找到近期成交，当前展示的是全平台近期活跃交易者。")
+    st.success(f"找到 {st.session_state.scan_market_count} 个相关市场 · 去重后得到 {st.session_state.scan_addr_count} 个 SPX/NDX 交易者")
 
     st.subheader("🏆 指数交易者列表（可勾选并加入关注）")
     edited = st.data_editor(
