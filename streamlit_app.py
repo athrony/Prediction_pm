@@ -32,7 +32,7 @@ DATA_API_TRADES_URL = "https://data-api.polymarket.com/trades"
 INDEX_KEYWORDS = [
     "s&p 500", "s&p500", "s\u0026p 500", "s\u0026p500",
     "nasdaq", "spx", "ndx",
-    "s and p 500", "standard and poor", "stock index", "market index",
+    "s and p 500", "standard and poor",
 ]
 PROFILE_BASE = "https://polymarket.com/profile/"
 
@@ -135,12 +135,6 @@ def fetch_index_markets():
 
 
 # --- 3. 第二步：提取地址 ---
-def _trade_is_index_related(t):
-    """判断一笔成交是否与 SPX/NDX 指数相关（按标题/slug 匹配关键词）"""
-    title = (t.get("title") or t.get("slug") or "").lower()
-    return any(kw in title for kw in INDEX_KEYWORDS)
-
-
 def _normalize_ts(ts):
     """API 可能返回秒或毫秒，统一为秒"""
     if not ts:
@@ -150,69 +144,34 @@ def _normalize_ts(ts):
 
 def fetch_trades_for_markets(condition_ids, since_ts):
     """
-    拉取 SPX/NDX 相关交易并提取用户地址。
-    策略 1：按 market(conditionId) 精确拉取。
-    策略 2：拉取全平台近期成交，按 conditionId 或标题关键词双重匹配。
-    绝不返回与 SPX/NDX 无关的用户。
+    严格按 conditionId 从 /trades 拉取成交记录，只提取在这些市场中有交易的用户地址。
+    逐个 conditionId 请求，确保只拿到 SPX/NDX 市场的真实交易者。
     """
     if not condition_ids:
         return set()
-    condition_set = set(condition_ids)
     addresses = set()
 
-    def _is_index_trade(t):
-        cid = (t.get("conditionId") or "").strip()
-        if cid in condition_set:
-            return True
-        return _trade_is_index_related(t)
-
-    def parse_trades(trades):
-        out = set()
-        for t in trades:
-            ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
-            if ts < since_ts:
-                continue
-            if not _is_index_trade(t):
-                continue
-            addr = (t.get("proxyWallet") or t.get("user") or t.get("owner") or "").strip()
-            if addr and isinstance(addr, str) and addr.startswith("0x"):
-                out.add(addr)
-        return out
-
-    # 策略 1：按 market(conditionId) 精确拉取
-    for i in range(0, min(len(condition_ids), 25), 5):
-        chunk = condition_ids[i : i + 5]
-        market_param = ",".join(chunk)
-        try:
-            r = requests.get(
-                DATA_API_TRADES_URL,
-                params={"market": market_param, "limit": 5000},
-                timeout=20,
-            )
-            r.raise_for_status()
-            trades = r.json()
-            if isinstance(trades, list):
-                addresses |= parse_trades(trades)
-        except Exception:
-            pass
-
-    if addresses:
-        return addresses
-
-    # 策略 2：拉取全平台近期成交，按 conditionId 或标题关键词匹配 SPX/NDX
-    for offset in (0, 5000):
-        try:
-            r = requests.get(
-                DATA_API_TRADES_URL,
-                params={"limit": 5000, "offset": offset},
-                timeout=25,
-            )
-            r.raise_for_status()
-            trades = r.json()
-            if isinstance(trades, list):
-                addresses |= parse_trades(trades)
-        except Exception:
-            break
+    for cid in condition_ids:
+        for offset in (0, 5000):
+            try:
+                r = requests.get(
+                    DATA_API_TRADES_URL,
+                    params={"market": cid, "limit": 5000, "offset": offset},
+                    timeout=20,
+                )
+                r.raise_for_status()
+                trades = r.json()
+            except Exception:
+                break
+            if not isinstance(trades, list) or not trades:
+                break
+            for t in trades:
+                ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
+                if ts < since_ts:
+                    continue
+                addr = (t.get("proxyWallet") or "").strip()
+                if addr and addr.startswith("0x"):
+                    addresses.add(addr)
 
     return addresses
 
@@ -275,18 +234,18 @@ def build_traders_df(addresses, metrics_map):
 
 def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_ts):
     """
-    拉取 watchlist 中每个用户最近 24 小时内与 SPX/NDX 相关的下注。
-    策略：逐用户请求 /trades?user=addr，在客户端按关键词和 conditionId 两种方式判断是否属于 SPX/NDX。
+    拉取 watchlist 中每个用户最近 24 小时内在 SPX/NDX 市场的下注。
+    严格按 conditionId 匹配，不用关键词模糊匹配。
     """
-    if not watchlist_addresses:
+    if not watchlist_addresses or not condition_ids:
         return []
-    condition_set = set(condition_ids) if condition_ids else set()
+    condition_set = set(condition_ids)
     out = []
     for addr in watchlist_addresses:
         try:
             r = requests.get(
                 DATA_API_TRADES_URL,
-                params={"user": addr, "limit": 200},
+                params={"user": addr, "limit": 500},
                 timeout=15,
             )
             r.raise_for_status()
@@ -300,8 +259,7 @@ def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_
             if ts < since_ts:
                 continue
             cid = (t.get("conditionId") or "").strip()
-            is_index = (cid in condition_set) or _trade_is_index_related(t)
-            if not is_index:
+            if cid not in condition_set:
                 continue
             out.append({
                 "timestamp": ts,
