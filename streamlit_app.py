@@ -926,7 +926,11 @@ if st.session_state.watchlist:
         avatar = item.get("avatar", "")
         score = item.get("score", 0)
 
-        cols = st.columns([0.5, 2.5, 1, 1, 1, 1, 1, 0.8, 0.8])
+        gp = item.get("gross_profit", 0)
+        gl = item.get("gross_loss", 0)
+        pnl = gp - gl if (gp or gl) else None
+
+        cols = st.columns([0.5, 2.5, 0.8, 0.8, 0.8, 1, 1, 1, 0.8, 0.8])
         with cols[0]:
             if avatar:
                 st.image(avatar, width=40)
@@ -947,19 +951,24 @@ if st.session_state.watchlist:
             pf = item.get("profit_factor", 0)
             st.metric("盈亏比", f"{pf:.2f}" if pf else "—")
         with cols[5]:
+            if pnl is not None:
+                st.metric("P/L", f"${pnl:+,.2f}")
+            else:
+                st.caption("P/L: —")
+        with cols[6]:
             vol = item.get("volume", 0)
             st.metric("交易量", f"${vol:,.0f}" if vol else "—")
-        with cols[6]:
+        with cols[7]:
             tc = item.get("trade_count", 0)
             st.metric("交易笔数", f"{tc}" if tc else "—")
-        with cols[7]:
+        with cols[8]:
             btn_cols = st.columns(2)
             with btn_cols[0]:
                 if st.button("🔍", key=f"solo_{idx}", help="单独查询该用户持仓"):
                     st.session_state[f"solo_query_{idx}"] = True
             with btn_cols[1]:
                 st.link_button("🔗", f"{PROFILE_BASE}{addr}", help="查看 Profile")
-        with cols[8]:
+        with cols[9]:
             if st.button("❌", key=f"rm_{idx}", help="移除该用户"):
                 st.session_state.watchlist.pop(idx)
                 save_watchlist(st.session_state.watchlist)
