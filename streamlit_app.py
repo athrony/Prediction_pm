@@ -452,7 +452,7 @@ def build_traders_df(trader_stats, holder_data, weights):
 DATA_API_POSITIONS_URL = f"{DATA_API_BASE}/positions"
 
 
-def fetch_active_positions_for_watchlist(watchlist_addresses, condition_ids):
+def fetch_active_positions_for_watchlist(watchlist_addresses, condition_ids, progress_bar=None):
     """
     查询关注用户在 SPX/NDX 市场中所有 Active 持仓（未平仓）。
 
@@ -463,31 +463,23 @@ def fetch_active_positions_for_watchlist(watchlist_addresses, condition_ids):
         return []
     cid_set = set(condition_ids)
     out = []
-    for addr in watchlist_addresses:
-        all_pos = []
-        offset = 0
-        while True:
-            try:
-                r = requests.get(
-                    DATA_API_POSITIONS_URL,
-                    params={
-                        "user": addr,
-                        "limit": 500,
-                        "offset": offset,
-                        "sizeThreshold": 0.01,
-                    },
-                    timeout=15,
-                )
-                r.raise_for_status()
-                batch = r.json()
-            except Exception:
-                break
-            if not isinstance(batch, list) or not batch:
-                break
-            all_pos.extend(batch)
-            if len(batch) < 500:
-                break
-            offset += 500
+    total = len(watchlist_addresses)
+    for i, addr in enumerate(watchlist_addresses):
+        if progress_bar:
+            short = addr[:8] + "..." + addr[-4:]
+            progress_bar.progress((i + 1) / total, text=f"查询持仓 ({i+1}/{total}) {short}")
+        try:
+            r = requests.get(
+                DATA_API_POSITIONS_URL,
+                params={"user": addr, "limit": 500, "sizeThreshold": 0.01},
+                timeout=10,
+            )
+            r.raise_for_status()
+            all_pos = r.json()
+        except Exception:
+            continue
+        if not isinstance(all_pos, list):
+            continue
 
         for p in all_pos:
             cid = (p.get("conditionId") or "").strip()
@@ -636,20 +628,20 @@ if st.session_state.watchlist:
         save_watchlist([])
         st.rerun()
 
-    if st.button("🔄 刷新持仓数据"):
-        st.session_state.watchlist_positions = None
-        st.rerun()
-
-    st.caption("展示关注用户在 SPX/NDX 市场中所有 Active（未平仓）持仓")
     cids = st.session_state.get("spx_ndx_market_ids") or []
 
-    if "watchlist_positions" not in st.session_state or st.session_state.watchlist_positions is None:
-        with st.spinner("正在查询关注用户的 SPX/NDX 持仓..."):
+    if st.button("🔄 查询 / 刷新 SPX/NDX 持仓"):
+        if not cids:
+            st.warning("请先执行一次扫描以获取 SPX/NDX 市场列表。")
+        else:
+            progress_bar = st.progress(0, text="查询持仓中...")
             st.session_state.watchlist_positions = fetch_active_positions_for_watchlist(
-                st.session_state.watchlist, cids
+                st.session_state.watchlist, cids, progress_bar=progress_bar
             )
+            progress_bar.empty()
 
-    positions = st.session_state.watchlist_positions
+    st.caption("关注用户在 SPX/NDX 市场中所有 Active（未平仓）持仓")
+    positions = st.session_state.get("watchlist_positions")
     if positions:
         pos_data = []
         for p in positions:
@@ -678,7 +670,9 @@ if st.session_state.watchlist:
             },
             hide_index=True, use_container_width=True,
         )
-    else:
+    elif positions is not None:
         st.info("关注用户在 SPX/NDX 市场中暂无 Active 持仓。")
+    else:
+        st.info("点击上方「🔄 查询 / 刷新 SPX/NDX 持仓」查看持仓数据。")
 else:
     st.info("关注列表为空。请先扫描并勾选地址后点击「添加到关注」。")
