@@ -80,26 +80,13 @@ def _extract_markets_from_event(ev, out_by_cid):
 @st.cache_data(ttl=300)
 def fetch_index_markets():
     """
-    三种策略拉取 SPX/NDX 相关市场：
-    1. 按已知 event slug 精确获取（解决 restricted 市场不出现在通用列表中的问题）
-    2. 按 tag_id (S&P 500, Indicies) 搜索
-    3. 通用列表 + 关键词匹配（兜底）
+    拉取 SPX/NDX 相关市场：
+    1. 按 tag_id (S&P 500=102849, Indicies=102682) 搜索（最高效，1-2 个请求）
+    2. 通用列表 + 关键词匹配（兜底）
     """
     out_by_cid = {}
 
-    # 策略 1：按已知 slug 精确获取
-    for slug in KNOWN_INDEX_EVENT_SLUGS:
-        try:
-            r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=10)
-            r.raise_for_status()
-            events = r.json()
-            if isinstance(events, list):
-                for ev in events:
-                    _extract_markets_from_event(ev, out_by_cid)
-        except Exception:
-            pass
-
-    # 策略 2：按 tag_id 搜索
+    # 策略 1：按 tag_id 搜索（涵盖 restricted 市场）
     for tag_id in INDEX_TAG_IDS:
         try:
             r = requests.get(
@@ -115,21 +102,22 @@ def fetch_index_markets():
         except Exception:
             pass
 
-    # 策略 3：通用列表 + 关键词匹配
-    try:
-        r = requests.get(
-            GAMMA_EVENTS_URL,
-            params={"limit": 200, "closed": "false", "active": "true"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        events = r.json()
-        if isinstance(events, list):
-            for ev in events:
-                if _market_matches_index_keywords(ev):
-                    _extract_markets_from_event(ev, out_by_cid)
-    except Exception:
-        pass
+    # 策略 2：通用列表 + 关键词匹配
+    if not out_by_cid:
+        try:
+            r = requests.get(
+                GAMMA_EVENTS_URL,
+                params={"limit": 200, "closed": "false", "active": "true"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            events = r.json()
+            if isinstance(events, list):
+                for ev in events:
+                    if _market_matches_index_keywords(ev):
+                        _extract_markets_from_event(ev, out_by_cid)
+        except Exception:
+            pass
 
     return list(out_by_cid.values())
 
@@ -142,36 +130,44 @@ def _normalize_ts(ts):
     return int(ts) // 1000 if int(ts) > 1e12 else int(ts)
 
 
-def fetch_trades_for_markets(condition_ids, since_ts):
+def fetch_trades_for_markets(condition_ids, since_ts, progress_bar=None):
     """
-    严格按 conditionId 从 /trades 拉取成交记录，只提取在这些市场中有交易的用户地址。
-    逐个 conditionId 请求，确保只拿到 SPX/NDX 市场的真实交易者。
+    按 conditionId 批量从 /trades 拉取成交记录，只提取在这些市场中有交易的用户地址。
+    每批 3 个 conditionId，减少请求次数。
     """
     if not condition_ids:
         return set()
     addresses = set()
+    batch_size = 3
+    total_batches = (len(condition_ids) + batch_size - 1) // batch_size
 
-    for cid in condition_ids:
-        for offset in (0, 5000):
-            try:
-                r = requests.get(
-                    DATA_API_TRADES_URL,
-                    params={"market": cid, "limit": 5000, "offset": offset},
-                    timeout=20,
-                )
-                r.raise_for_status()
-                trades = r.json()
-            except Exception:
-                break
-            if not isinstance(trades, list) or not trades:
-                break
-            for t in trades:
-                ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
-                if ts < since_ts:
-                    continue
-                addr = (t.get("proxyWallet") or "").strip()
-                if addr and addr.startswith("0x"):
-                    addresses.add(addr)
+    for batch_idx in range(total_batches):
+        chunk = condition_ids[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        market_param = ",".join(chunk)
+        if progress_bar:
+            progress_bar.progress(
+                (batch_idx + 1) / total_batches,
+                text=f"正在拉取交易数据... ({batch_idx + 1}/{total_batches})",
+            )
+        try:
+            r = requests.get(
+                DATA_API_TRADES_URL,
+                params={"market": market_param, "limit": 10000},
+                timeout=30,
+            )
+            r.raise_for_status()
+            trades = r.json()
+        except Exception:
+            continue
+        if not isinstance(trades, list):
+            continue
+        for t in trades:
+            ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
+            if ts < since_ts:
+                continue
+            addr = (t.get("proxyWallet") or "").strip()
+            if addr and addr.startswith("0x"):
+                addresses.add(addr)
 
     return addresses
 
@@ -317,8 +313,10 @@ if do_scan:
 
     delta = SCAN_RANGE_OPTIONS.get(scan_range_label, timedelta(hours=24))
     since_ts = int((datetime.now(timezone.utc) - delta).timestamp())
-    with st.spinner(f"第二步：提取{scan_range_label}交易用户地址..."):
-        all_addresses = fetch_trades_for_markets(condition_ids, since_ts)
+    st.write(f"第二步：提取{scan_range_label}交易用户地址（共 {len(condition_ids)} 个市场）...")
+    progress_bar = st.progress(0, text="正在拉取交易数据...")
+    all_addresses = fetch_trades_for_markets(condition_ids, since_ts, progress_bar=progress_bar)
+    progress_bar.empty()
     if not all_addresses:
         st.warning(
             f"{scan_range_label}内未找到 SPX/NDX 相关交易者。"
