@@ -131,6 +131,35 @@ def fetch_user_profile(address):
         return {"username": "", "avatar": ""}
 
 
+def compute_score_for_address(addr, trades_list, weights):
+    """从交易记录中计算单个地址的评分数据"""
+    user_trades = [t for t in trades_list if (t.get("proxyWallet") or "").strip() == addr]
+    if not user_trades:
+        return {}
+    stats = compute_trader_stats(user_trades)
+    s = stats.get(addr)
+    if not s:
+        return {}
+    row = {
+        "交易笔数": s["trade_count"],
+        "交易量": s["volume"],
+        "胜率": s["win_rate"],
+        "盈亏比": s["profit_factor"],
+        "潜在盈利": s["gross_profit"],
+        "潜在亏损": s["gross_loss"],
+    }
+    score = calculate_score(row, weights)
+    return {
+        "score": score,
+        "trade_count": s["trade_count"],
+        "volume": s["volume"],
+        "win_rate": s["win_rate"],
+        "profit_factor": s["profit_factor"],
+        "gross_profit": s["gross_profit"],
+        "gross_loss": s["gross_loss"],
+    }
+
+
 def watchlist_to_excel_bytes(wl):
     """将关注列表导出为 Excel 字节流"""
     rows = []
@@ -139,6 +168,13 @@ def watchlist_to_excel_bytes(wl):
             "address": item["address"],
             "username": item.get("username", ""),
             "avatar": item.get("avatar", ""),
+            "score": item.get("score", ""),
+            "trade_count": item.get("trade_count", ""),
+            "volume": item.get("volume", ""),
+            "win_rate": item.get("win_rate", ""),
+            "profit_factor": item.get("profit_factor", ""),
+            "gross_profit": item.get("gross_profit", ""),
+            "gross_loss": item.get("gross_loss", ""),
             "profile_url": f"{PROFILE_BASE}{item['address']}",
         })
     df = pd.DataFrame(rows)
@@ -155,11 +191,16 @@ def watchlist_from_excel(uploaded_file):
         addr = str(row.get("address", "")).strip()
         if not addr:
             continue
-        items.append({
+        item = {
             "address": addr,
             "username": str(row.get("username", "") or ""),
             "avatar": str(row.get("avatar", "") or ""),
-        })
+        }
+        for key in ("score", "trade_count", "volume", "win_rate", "profit_factor", "gross_profit", "gross_loss"):
+            val = row.get(key)
+            if pd.notna(val):
+                item[key] = float(val)
+        items.append(item)
     return items
 
 
@@ -756,11 +797,17 @@ if st.session_state.scan_df is not None:
             for _, row in selected.iterrows():
                 addr = row.get("address", "")
                 if addr and addr not in existing_addrs:
-                    username = row.get("用户名", "")
                     st.session_state.watchlist.append({
                         "address": addr,
-                        "username": username,
+                        "username": row.get("用户名", ""),
                         "avatar": "",
+                        "score": row.get("Score", 0),
+                        "trade_count": int(row.get("交易笔数", 0)),
+                        "volume": float(row.get("交易量", 0)),
+                        "win_rate": float(row.get("胜率", 0)),
+                        "profit_factor": float(row.get("盈亏比", 0)),
+                        "gross_profit": float(row.get("潜在盈利", 0)),
+                        "gross_loss": float(row.get("潜在亏损", 0)),
                     })
                     existing_addrs.add(addr)
                     added += 1
@@ -778,7 +825,7 @@ st.subheader("👁 关注列表与 SPX/NDX 实时动态")
 
 if st.session_state.watchlist:
     # --- 关注列表工具栏 ---
-    wl_col1, wl_col2, wl_col3, wl_col4 = st.columns([1, 1, 1, 1])
+    wl_col1, wl_col2, wl_col3, wl_col4, wl_col5 = st.columns([1, 1, 1, 1, 1])
     with wl_col1:
         if st.button("🔄 刷新头像 / 用户名"):
             with st.spinner("正在获取用户资料..."):
@@ -793,15 +840,33 @@ if st.session_state.watchlist:
             st.success(f"已更新 {updated} 个用户的资料")
             st.rerun()
     with wl_col2:
+        if st.button("📊 刷新评分数据"):
+            cache = load_cached_trades()
+            cached_trades = cache.get("trades", [])
+            if not cached_trades:
+                st.warning("本地无缓存交易数据，请先执行一次扫描。")
+            else:
+                weights = (w_consistency, w_returns, w_winrate, w_maxloss, w_pf)
+                with st.spinner("正在计算评分..."):
+                    updated = 0
+                    for item in st.session_state.watchlist:
+                        score_data = compute_score_for_address(item["address"], cached_trades, weights)
+                        if score_data:
+                            item.update(score_data)
+                            updated += 1
+                    save_watchlist(st.session_state.watchlist)
+                st.success(f"已更新 {updated} 个用户的评分")
+                st.rerun()
+    with wl_col3:
         st.download_button(
             "📥 导出关注列表",
             data=watchlist_to_excel_bytes(st.session_state.watchlist),
             file_name=f"watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    with wl_col3:
-        wl_upload = st.file_uploader("📤 导入关注列表", type=["xlsx"], key="wl_upload", label_visibility="collapsed")
     with wl_col4:
+        wl_upload = st.file_uploader("📤 导入关注列表", type=["xlsx"], key="wl_upload", label_visibility="collapsed")
+    with wl_col5:
         if st.button("🗑 清空关注列表", type="secondary"):
             st.session_state.watchlist = []
             save_watchlist([])
@@ -834,11 +899,19 @@ if st.session_state.watchlist:
                     st.warning("该地址已在关注列表中。")
                 else:
                     profile = fetch_user_profile(addr)
-                    st.session_state.watchlist.append({
+                    new_item = {
                         "address": addr,
                         "username": profile["username"],
                         "avatar": profile["avatar"],
-                    })
+                    }
+                    cache = load_cached_trades()
+                    cached_trades = cache.get("trades", [])
+                    if cached_trades:
+                        weights = (w_consistency, w_returns, w_winrate, w_maxloss, w_pf)
+                        score_data = compute_score_for_address(addr, cached_trades, weights)
+                        if score_data:
+                            new_item.update(score_data)
+                    st.session_state.watchlist.append(new_item)
                     save_watchlist(st.session_state.watchlist)
                     st.success(f"已添加: {profile['username'] or addr[:12] + '...'}")
                     st.rerun()
@@ -851,8 +924,9 @@ if st.session_state.watchlist:
         addr = item["address"]
         uname = item.get("username", "") or addr[:10] + "..."
         avatar = item.get("avatar", "")
+        score = item.get("score", 0)
 
-        cols = st.columns([0.6, 4, 1.5, 1, 1])
+        cols = st.columns([0.5, 2.5, 1, 1, 1, 1, 1, 0.8, 0.8])
         with cols[0]:
             if avatar:
                 st.image(avatar, width=40)
@@ -862,11 +936,30 @@ if st.session_state.watchlist:
             st.markdown(f"**{uname}**")
             st.caption(f"`{addr[:8]}...{addr[-6:]}`")
         with cols[2]:
-            st.link_button("🔗 Profile", f"{PROFILE_BASE}{addr}", use_container_width=True)
+            if score:
+                st.metric("评分", f"{score:.1f}")
+            else:
+                st.caption("评分: —")
         with cols[3]:
-            if st.button("🔍", key=f"solo_{idx}", help="单独查询该用户持仓"):
-                st.session_state[f"solo_query_{idx}"] = True
+            wr = item.get("win_rate", 0)
+            st.metric("胜率", f"{wr:.0%}" if wr else "—")
         with cols[4]:
+            pf = item.get("profit_factor", 0)
+            st.metric("盈亏比", f"{pf:.2f}" if pf else "—")
+        with cols[5]:
+            vol = item.get("volume", 0)
+            st.metric("交易量", f"${vol:,.0f}" if vol else "—")
+        with cols[6]:
+            tc = item.get("trade_count", 0)
+            st.metric("交易笔数", f"{tc}" if tc else "—")
+        with cols[7]:
+            btn_cols = st.columns(2)
+            with btn_cols[0]:
+                if st.button("🔍", key=f"solo_{idx}", help="单独查询该用户持仓"):
+                    st.session_state[f"solo_query_{idx}"] = True
+            with btn_cols[1]:
+                st.link_button("🔗", f"{PROFILE_BASE}{addr}", help="查看 Profile")
+        with cols[8]:
             if st.button("❌", key=f"rm_{idx}", help="移除该用户"):
                 st.session_state.watchlist.pop(idx)
                 save_watchlist(st.session_state.watchlist)
