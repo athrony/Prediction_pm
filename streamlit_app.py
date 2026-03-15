@@ -455,32 +455,44 @@ DATA_API_POSITIONS_URL = f"{DATA_API_BASE}/positions"
 def fetch_active_positions_for_watchlist(watchlist_addresses, condition_ids):
     """
     查询关注用户在 SPX/NDX 市场中所有 Active 持仓（未平仓）。
-    使用 /positions?user=addr&market=cid 接口。
+
+    conditionId 数量过多时 URL 会超长触发 414，因此先拉取用户全部持仓，
+    再按 conditionId 集合在客户端过滤。
     """
     if not watchlist_addresses or not condition_ids:
         return []
+    cid_set = set(condition_ids)
     out = []
     for addr in watchlist_addresses:
-        try:
-            r = requests.get(
-                DATA_API_POSITIONS_URL,
-                params={
-                    "user": addr,
-                    "market": ",".join(condition_ids),
-                    "limit": 500,
-                    "sizeThreshold": 0.01,
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
-            positions = r.json()
-        except Exception:
-            continue
-        if not isinstance(positions, list):
-            continue
-        for p in positions:
+        all_pos = []
+        offset = 0
+        while True:
+            try:
+                r = requests.get(
+                    DATA_API_POSITIONS_URL,
+                    params={
+                        "user": addr,
+                        "limit": 500,
+                        "offset": offset,
+                        "sizeThreshold": 0.01,
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
+                batch = r.json()
+            except Exception:
+                break
+            if not isinstance(batch, list) or not batch:
+                break
+            all_pos.extend(batch)
+            if len(batch) < 500:
+                break
+            offset += 500
+
+        for p in all_pos:
+            cid = (p.get("conditionId") or "").strip()
             size = p.get("size", 0)
-            if size <= 0:
+            if cid not in cid_set or size <= 0:
                 continue
             out.append({
                 "address": addr,
