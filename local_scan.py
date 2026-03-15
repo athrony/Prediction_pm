@@ -85,12 +85,18 @@ def merge_trades(existing, new_trades):
 
 
 def load_watchlist():
+    """加载关注列表，兼容旧格式 [addr, ...] 和新格式 [{address, ...}, ...]"""
     if WATCHLIST_FILE.exists():
         try:
             with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
+            return []
+        if not isinstance(data, list):
+            return []
+        if data and isinstance(data[0], str):
+            return data
+        return [item["address"] for item in data if isinstance(item, dict) and "address" in item]
     return []
 
 

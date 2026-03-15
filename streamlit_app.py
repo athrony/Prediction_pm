@@ -8,7 +8,6 @@ Polymarket SPX/NDX 垂直市场扫描 — Market-First 精英交易者发现与�
 """
 import io
 import json
-import os
 import streamlit as st
 import pandas as pd
 import requests
@@ -20,6 +19,7 @@ st.set_page_config(page_title="Polymarket 指数交易者追踪", layout="wide")
 st.title("📊 Polymarket SPX/NDX 精英交易者追踪")
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+GAMMA_PROFILE_URL = "https://gamma-api.polymarket.com/public-profile"
 DATA_API_BASE = "https://data-api.polymarket.com"
 DATA_API_TRADES_URL = f"{DATA_API_BASE}/trades"
 DATA_API_HOLDERS_URL = f"{DATA_API_BASE}/holders"
@@ -81,12 +81,20 @@ def merge_trades(existing, new_trades):
 
 
 def load_watchlist():
+    """加载关注列表。兼容旧格式 [addr, ...] 自动迁移为 [{address, username, avatar}, ...]"""
     if WATCHLIST_FILE.exists():
         try:
             with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
+            return []
+        if not isinstance(data, list):
+            return []
+        if data and isinstance(data[0], str):
+            migrated = [{"address": a, "username": "", "avatar": ""} for a in data]
+            save_watchlist(migrated)
+            return migrated
+        return data
     return []
 
 
@@ -94,6 +102,65 @@ def save_watchlist(wl):
     _ensure_data_dir()
     with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
         json.dump(wl, f, ensure_ascii=False)
+
+
+def watchlist_addresses(wl):
+    """从关注列表提取地址列表"""
+    return [item["address"] for item in wl]
+
+
+def watchlist_find(wl, addr):
+    """在关注列表中查找指定地址的条目"""
+    for item in wl:
+        if item["address"] == addr:
+            return item
+    return None
+
+
+def fetch_user_profile(address):
+    """从 Polymarket Gamma API 获取用户公开资料（头像、用户名）"""
+    try:
+        r = requests.get(GAMMA_PROFILE_URL, params={"address": address}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "username": data.get("name") or data.get("pseudonym") or "",
+            "avatar": data.get("profileImage") or "",
+        }
+    except Exception:
+        return {"username": "", "avatar": ""}
+
+
+def watchlist_to_excel_bytes(wl):
+    """将关注列表导出为 Excel 字节流"""
+    rows = []
+    for item in wl:
+        rows.append({
+            "address": item["address"],
+            "username": item.get("username", ""),
+            "avatar": item.get("avatar", ""),
+            "profile_url": f"{PROFILE_BASE}{item['address']}",
+        })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    return buf.getvalue()
+
+
+def watchlist_from_excel(uploaded_file):
+    """从 Excel 导入关注列表"""
+    df = pd.read_excel(uploaded_file, engine="openpyxl")
+    items = []
+    for _, row in df.iterrows():
+        addr = str(row.get("address", "")).strip()
+        if not addr:
+            continue
+        items.append({
+            "address": addr,
+            "username": str(row.get("username", "") or ""),
+            "avatar": str(row.get("avatar", "") or ""),
+        })
+    return items
 
 
 def load_cached_condition_ids():
@@ -684,16 +751,23 @@ if st.session_state.scan_df is not None:
     with col_add:
         if st.button("➕ 添加到关注"):
             selected = edited[edited["选中"] == True]
-            addrs = selected["address"].tolist()
+            existing_addrs = set(watchlist_addresses(st.session_state.watchlist))
             added = 0
-            for a in addrs:
-                if a and a not in st.session_state.watchlist:
-                    st.session_state.watchlist.append(a)
+            for _, row in selected.iterrows():
+                addr = row.get("address", "")
+                if addr and addr not in existing_addrs:
+                    username = row.get("用户名", "")
+                    st.session_state.watchlist.append({
+                        "address": addr,
+                        "username": username,
+                        "avatar": "",
+                    })
+                    existing_addrs.add(addr)
                     added += 1
             if added:
                 save_watchlist(st.session_state.watchlist)
                 st.success(f"已添加 {added} 个地址到关注列表（已持久化）")
-            elif not addrs:
+            elif selected.empty:
                 st.warning("请先勾选至少一个地址，再点击添加。")
 else:
     st.info("点击左侧「🔍 增量扫描」或「🔄 全量刷新」开始，或从侧边栏导入历史数据。")
@@ -701,24 +775,143 @@ else:
 # --------------- 关注列表与实时追踪 ---------------
 st.divider()
 st.subheader("👁 关注列表与 SPX/NDX 实时动态")
-if st.session_state.watchlist:
-    st.caption("当前关注地址（点击跳转 Polymarket 个人页）")
-    for addr in st.session_state.watchlist:
-        st.markdown(f"- [{addr}]({PROFILE_BASE}{addr})")
-    if st.button("清空关注列表", type="secondary"):
-        st.session_state.watchlist = []
-        save_watchlist([])
-        st.rerun()
 
+if st.session_state.watchlist:
+    # --- 关注列表工具栏 ---
+    wl_col1, wl_col2, wl_col3, wl_col4 = st.columns([1, 1, 1, 1])
+    with wl_col1:
+        if st.button("🔄 刷新头像 / 用户名"):
+            with st.spinner("正在获取用户资料..."):
+                updated = 0
+                for item in st.session_state.watchlist:
+                    profile = fetch_user_profile(item["address"])
+                    if profile["username"] or profile["avatar"]:
+                        item["username"] = profile["username"] or item.get("username", "")
+                        item["avatar"] = profile["avatar"] or item.get("avatar", "")
+                        updated += 1
+                save_watchlist(st.session_state.watchlist)
+            st.success(f"已更新 {updated} 个用户的资料")
+            st.rerun()
+    with wl_col2:
+        st.download_button(
+            "📥 导出关注列表",
+            data=watchlist_to_excel_bytes(st.session_state.watchlist),
+            file_name=f"watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with wl_col3:
+        wl_upload = st.file_uploader("📤 导入关注列表", type=["xlsx"], key="wl_upload", label_visibility="collapsed")
+    with wl_col4:
+        if st.button("🗑 清空关注列表", type="secondary"):
+            st.session_state.watchlist = []
+            save_watchlist([])
+            st.rerun()
+
+    if wl_upload is not None:
+        try:
+            imported = watchlist_from_excel(wl_upload)
+            existing = set(watchlist_addresses(st.session_state.watchlist))
+            added = 0
+            for item in imported:
+                if item["address"] not in existing:
+                    st.session_state.watchlist.append(item)
+                    existing.add(item["address"])
+                    added += 1
+            save_watchlist(st.session_state.watchlist)
+            st.success(f"已导入 {added} 个新地址（重复 {len(imported) - added} 个已跳过）")
+            st.rerun()
+        except Exception as e:
+            st.error(f"导入失败: {e}")
+
+    # --- 手动添加地址 ---
+    with st.expander("➕ 手动添加地址"):
+        manual_addr = st.text_input("输入钱包地址", placeholder="0x...", key="manual_addr_input")
+        if st.button("添加", key="manual_add_btn"):
+            addr = manual_addr.strip()
+            if addr:
+                existing = set(watchlist_addresses(st.session_state.watchlist))
+                if addr in existing:
+                    st.warning("该地址已在关注列表中。")
+                else:
+                    profile = fetch_user_profile(addr)
+                    st.session_state.watchlist.append({
+                        "address": addr,
+                        "username": profile["username"],
+                        "avatar": profile["avatar"],
+                    })
+                    save_watchlist(st.session_state.watchlist)
+                    st.success(f"已添加: {profile['username'] or addr[:12] + '...'}")
+                    st.rerun()
+            else:
+                st.warning("请输入有效的钱包地址。")
+
+    # --- 每个用户卡片 ---
+    st.caption(f"当前关注 {len(st.session_state.watchlist)} 个用户")
+    for idx, item in enumerate(st.session_state.watchlist):
+        addr = item["address"]
+        uname = item.get("username", "") or addr[:10] + "..."
+        avatar = item.get("avatar", "")
+
+        cols = st.columns([0.6, 4, 1.5, 1, 1])
+        with cols[0]:
+            if avatar:
+                st.image(avatar, width=40)
+            else:
+                st.markdown("👤")
+        with cols[1]:
+            st.markdown(f"**{uname}**")
+            st.caption(f"`{addr[:8]}...{addr[-6:]}`")
+        with cols[2]:
+            st.link_button("🔗 Profile", f"{PROFILE_BASE}{addr}", use_container_width=True)
+        with cols[3]:
+            if st.button("🔍", key=f"solo_{idx}", help="单独查询该用户持仓"):
+                st.session_state[f"solo_query_{idx}"] = True
+        with cols[4]:
+            if st.button("❌", key=f"rm_{idx}", help="移除该用户"):
+                st.session_state.watchlist.pop(idx)
+                save_watchlist(st.session_state.watchlist)
+                st.rerun()
+
+        # 单独查询某个用户持仓
+        if st.session_state.get(f"solo_query_{idx}"):
+            cids = st.session_state.get("spx_ndx_market_ids") or []
+            if not cids:
+                st.warning("请先执行一次扫描以获取 SPX/NDX 市场列表。")
+            else:
+                with st.spinner(f"查询 {uname} 的持仓..."):
+                    solo_pos = fetch_active_positions_for_watchlist([addr], cids)
+                if solo_pos:
+                    solo_data = []
+                    for p in solo_pos:
+                        solo_data.append({
+                            "市场": (p.get("title") or "")[:60],
+                            "方向": p.get("outcome", ""),
+                            "持仓量": p.get("size"),
+                            "均价": p.get("avg_price"),
+                            "现价": p.get("cur_price"),
+                            "现值($)": p.get("current_value"),
+                            "成本($)": p.get("initial_value"),
+                            "盈亏($)": p.get("cash_pnl"),
+                            "盈亏%": p.get("pct_pnl"),
+                            "到期日": (p.get("end_date") or "")[:10],
+                        })
+                    st.dataframe(pd.DataFrame(solo_data), hide_index=True, use_container_width=True)
+                else:
+                    st.info(f"{uname} 暂无 SPX/NDX Active 持仓。")
+            del st.session_state[f"solo_query_{idx}"]
+
+    # --- 批量查询所有关注用户持仓 ---
+    st.divider()
     cids = st.session_state.get("spx_ndx_market_ids") or []
 
-    if st.button("🔄 查询 / 刷新 SPX/NDX 持仓"):
+    if st.button("🔄 查询 / 刷新全部关注用户 SPX/NDX 持仓"):
         if not cids:
             st.warning("请先执行一次扫描以获取 SPX/NDX 市场列表。")
         else:
+            addrs = watchlist_addresses(st.session_state.watchlist)
             progress_bar = st.progress(0, text="查询持仓中...")
             st.session_state.watchlist_positions = fetch_active_positions_for_watchlist(
-                st.session_state.watchlist, cids, progress_bar=progress_bar
+                addrs, cids, progress_bar=progress_bar
             )
             progress_bar.empty()
 
@@ -727,8 +920,11 @@ if st.session_state.watchlist:
     if positions:
         pos_data = []
         for p in positions:
+            addr = p["address"]
+            wl_item = watchlist_find(st.session_state.watchlist, addr)
+            display = (wl_item.get("username", "") if wl_item else "") or addr[:10] + "..."
             pos_data.append({
-                "地址": p["address"],
+                "用户": display,
                 "市场": (p.get("title") or "")[:60],
                 "方向": p.get("outcome", ""),
                 "持仓量": p.get("size"),
@@ -739,7 +935,7 @@ if st.session_state.watchlist:
                 "盈亏($)": p.get("cash_pnl"),
                 "盈亏%": p.get("pct_pnl"),
                 "到期日": (p.get("end_date") or "")[:10],
-                "Profile": f"{PROFILE_BASE}{p['address']}",
+                "Profile": f"{PROFILE_BASE}{addr}",
             })
         st.dataframe(
             pd.DataFrame(pos_data),
@@ -755,6 +951,6 @@ if st.session_state.watchlist:
     elif positions is not None:
         st.info("关注用户在 SPX/NDX 市场中暂无 Active 持仓。")
     else:
-        st.info("点击上方「🔄 查询 / 刷新 SPX/NDX 持仓」查看持仓数据。")
+        st.info("点击上方「🔄 查询 / 刷新全部关注用户 SPX/NDX 持仓」查看持仓数据。")
 else:
     st.info("关注列表为空。请先扫描并勾选地址后点击「添加到关注」。")
