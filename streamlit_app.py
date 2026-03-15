@@ -230,9 +230,22 @@ def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_
     return out[:50]
 
 
+# 扫描时间范围选项（用于第二步提取交易地址）
+SCAN_RANGE_OPTIONS = {
+    "过去24小时": timedelta(hours=24),
+    "过去一周": timedelta(days=7),
+    "过去一个月": timedelta(days=30),
+}
+
 # ========== 主流程 ==========
 st.sidebar.divider()
 st.sidebar.subheader("垂直市场扫描")
+scan_range_label = st.sidebar.radio(
+    "扫描时间范围",
+    options=list(SCAN_RANGE_OPTIONS.keys()),
+    index=0,
+    help="提取该时间范围内在 SPX/NDX 市场有交易的用户地址",
+)
 if st.sidebar.button("🔄 扫描 SPX/NDX 市场并提取交易者"):
     st.session_state.run_scan = True
 else:
@@ -251,11 +264,12 @@ if st.session_state.run_scan:
     st.session_state.spx_ndx_market_ids = condition_ids
     st.success(f"找到 {len(index_markets)} 个相关市场")
 
-    with st.spinner("第二步：提取近 24 小时交易用户地址..."):
-        since_ts = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
+    delta = SCAN_RANGE_OPTIONS.get(scan_range_label, timedelta(hours=24))
+    since_ts = int((datetime.now(timezone.utc) - delta).timestamp())
+    with st.spinner(f"第二步：提取{scan_range_label}交易用户地址..."):
         all_addresses = fetch_trades_for_markets(condition_ids, since_ts)
     if not all_addresses:
-        st.warning("近 24 小时内无交易流水，无法提取地址。")
+        st.warning(f"{scan_range_label}内无交易流水，无法提取地址。")
         st.stop()
     st.success(f"去重后得到 {len(all_addresses)} 个地址")
 
