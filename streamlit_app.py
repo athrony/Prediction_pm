@@ -447,42 +447,56 @@ def build_traders_df(trader_stats, holder_data, weights):
     return df.sort_values("Score", ascending=False).reset_index(drop=True)
 
 
-# ========== 6. Watchlist 下注查询 ==========
+# ========== 6. Watchlist: 查询关注用户的 Active 持仓 ==========
 
-def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_ts):
+DATA_API_POSITIONS_URL = f"{DATA_API_BASE}/positions"
+
+
+def fetch_active_positions_for_watchlist(watchlist_addresses, condition_ids):
+    """
+    查询关注用户在 SPX/NDX 市场中所有 Active 持仓（未平仓）。
+    使用 /positions?user=addr&market=cid 接口。
+    """
     if not watchlist_addresses or not condition_ids:
         return []
-    condition_set = set(condition_ids)
     out = []
     for addr in watchlist_addresses:
         try:
             r = requests.get(
-                DATA_API_TRADES_URL,
-                params={"user": addr, "limit": 500},
+                DATA_API_POSITIONS_URL,
+                params={
+                    "user": addr,
+                    "market": ",".join(condition_ids),
+                    "limit": 500,
+                    "sizeThreshold": 0.01,
+                },
                 timeout=15,
             )
             r.raise_for_status()
-            trades = r.json()
+            positions = r.json()
         except Exception:
             continue
-        if not isinstance(trades, list):
+        if not isinstance(positions, list):
             continue
-        for t in trades:
-            ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
-            if ts < since_ts:
-                continue
-            cid = (t.get("conditionId") or "").strip()
-            if cid not in condition_set:
+        for p in positions:
+            size = p.get("size", 0)
+            if size <= 0:
                 continue
             out.append({
-                "timestamp": ts, "address": addr,
-                "side": t.get("side", ""),
-                "title": t.get("title") or t.get("slug") or "",
-                "outcome": t.get("outcome", ""),
-                "price": t.get("price"), "size": t.get("size"),
+                "address": addr,
+                "title": p.get("title") or p.get("slug") or "",
+                "outcome": p.get("outcome", ""),
+                "size": round(size, 2),
+                "avg_price": round(p.get("avgPrice", 0), 4),
+                "cur_price": round(p.get("curPrice", 0), 4),
+                "current_value": round(p.get("currentValue", 0), 2),
+                "initial_value": round(p.get("initialValue", 0), 2),
+                "cash_pnl": round(p.get("cashPnl", 0), 2),
+                "pct_pnl": round(p.get("percentPnl", 0) * 100, 1) if p.get("percentPnl") else 0,
+                "end_date": p.get("endDate", ""),
             })
-    out.sort(key=lambda x: x["timestamp"], reverse=True)
-    return out[:200]
+    out.sort(key=lambda x: abs(x.get("current_value", 0)), reverse=True)
+    return out
 
 
 # ==================== 主流程 ====================
@@ -610,37 +624,49 @@ if st.session_state.watchlist:
         save_watchlist([])
         st.rerun()
 
-    if st.button("🔄 刷新 SPX/NDX 下注记录"):
-        st.session_state.watchlist_trades = None
+    if st.button("🔄 刷新持仓数据"):
+        st.session_state.watchlist_positions = None
         st.rerun()
 
-    st.caption("展示关注用户最近 24 小时内在 SPX/NDX 市场的下注")
+    st.caption("展示关注用户在 SPX/NDX 市场中所有 Active（未平仓）持仓")
     cids = st.session_state.get("spx_ndx_market_ids") or []
-    since_24h = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
 
-    if "watchlist_trades" not in st.session_state or st.session_state.watchlist_trades is None:
-        with st.spinner("正在查询关注用户的 SPX/NDX 下注记录..."):
-            st.session_state.watchlist_trades = fetch_recent_trades_for_watchlist(
-                st.session_state.watchlist, cids, since_24h
+    if "watchlist_positions" not in st.session_state or st.session_state.watchlist_positions is None:
+        with st.spinner("正在查询关注用户的 SPX/NDX 持仓..."):
+            st.session_state.watchlist_positions = fetch_active_positions_for_watchlist(
+                st.session_state.watchlist, cids
             )
 
-    recent = st.session_state.watchlist_trades
-    if recent:
-        trades_data = []
-        for t in recent:
-            ts_str = datetime.fromtimestamp(t["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            trades_data.append({
-                "时间": ts_str, "地址": t["address"], "方向": t.get("side", ""),
-                "市场": (t.get("title") or "")[:60], "结果": t.get("outcome", ""),
-                "价格": t.get("price"), "数量": t.get("size"),
-                "Profile": f"{PROFILE_BASE}{t['address']}",
+    positions = st.session_state.watchlist_positions
+    if positions:
+        pos_data = []
+        for p in positions:
+            pos_data.append({
+                "地址": p["address"],
+                "市场": (p.get("title") or "")[:60],
+                "方向": p.get("outcome", ""),
+                "持仓量": p.get("size"),
+                "均价": p.get("avg_price"),
+                "现价": p.get("cur_price"),
+                "现值($)": p.get("current_value"),
+                "成本($)": p.get("initial_value"),
+                "盈亏($)": p.get("cash_pnl"),
+                "盈亏%": p.get("pct_pnl"),
+                "到期日": (p.get("end_date") or "")[:10],
+                "Profile": f"{PROFILE_BASE}{p['address']}",
             })
         st.dataframe(
-            pd.DataFrame(trades_data),
-            column_config={"Profile": st.column_config.LinkColumn("Profile", display_text="查看")},
+            pd.DataFrame(pos_data),
+            column_config={
+                "Profile": st.column_config.LinkColumn("Profile", display_text="查看"),
+                "现值($)": st.column_config.NumberColumn(format="$%.2f"),
+                "成本($)": st.column_config.NumberColumn(format="$%.2f"),
+                "盈亏($)": st.column_config.NumberColumn(format="$%.2f"),
+                "盈亏%": st.column_config.NumberColumn(format="%.1f%%"),
+            },
             hide_index=True, use_container_width=True,
         )
     else:
-        st.info("关注用户在最近 24 小时内无 SPX/NDX 下注记录。")
+        st.info("关注用户在 SPX/NDX 市场中暂无 Active 持仓。")
 else:
     st.info("关注列表为空。请先扫描并勾选地址后点击「添加到关注」。")
