@@ -27,37 +27,84 @@ if "spx_ndx_market_ids" not in st.session_state:
     st.session_state.spx_ndx_market_ids = []  # conditionIds 用于实时追踪
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 DATA_API_TRADES_URL = "https://data-api.polymarket.com/trades"
-INDEX_KEYWORDS = ["S&P 500", "Nasdaq", "SPX", "NDX", "S&P500", "spx", "ndx"]
+# 关键词（不区分大小写）：匹配标题/描述中含以下任一词的市场
+INDEX_KEYWORDS = [
+    "s&p 500", "s&p500", "nasdaq", "spx", "ndx",
+    "s and p 500", "standard and poor", "stock index", "market index",
+]
 PROFILE_BASE = "https://polymarket.com/profile/"
+
+
+def _market_matches_index_keywords(m):
+    """判断市场标题/描述是否包含指数相关关键词"""
+    q = (m.get("question") or m.get("title") or "").lower()
+    desc = (m.get("description") or "").lower()
+    text = f"{q} {desc}"
+    return any(kw in text for kw in INDEX_KEYWORDS)
 
 
 # --- 2. 第一步：定位市场 ---
 @st.cache_data(ttl=300)
 def fetch_index_markets():
-    """从 Gamma API 拉取市场，筛选关键词包含 S&P 500 / Nasdaq / SPX / NDX 的活跃市场"""
+    """
+    从 Gamma API 拉取与 SPX/NDX 相关的市场（优先活跃，无活跃时含近期有交易的市场）。
+    先请求 /events（活跃），再请求 /markets（不限 closed），合并并去重。
+    """
+    out_by_cid = {}  # conditionId -> info，用于去重
+
+    # 策略 1：拉取活跃 events，从中提取 markets（含 conditionId）
     try:
-        r = requests.get(GAMMA_MARKETS_URL, params={"limit": 200, "closed": "false"}, timeout=15)
+        r = requests.get(
+            GAMMA_EVENTS_URL,
+            params={"limit": 200, "closed": "false", "active": "true"},
+            timeout=15,
+        )
         r.raise_for_status()
-        markets = r.json()
+        events = r.json()
+        if isinstance(events, list):
+            for ev in events:
+                if not _market_matches_index_keywords(ev):
+                    continue
+                # events 可能内嵌 markets 或单个 conditionId
+                markets_in = ev.get("markets") or []
+                if isinstance(markets_in, list) and markets_in:
+                    for mk in markets_in:
+                        cid = mk.get("conditionId") if isinstance(mk, dict) else None
+                        if cid and cid not in out_by_cid:
+                            out_by_cid[cid] = {"id": mk.get("id") or ev.get("id"), "conditionId": cid, "question": (ev.get("title") or ev.get("question") or "")[:80]}
+                else:
+                    cid = ev.get("conditionId")
+                    if cid and cid not in out_by_cid:
+                        out_by_cid[cid] = {"id": ev.get("id"), "conditionId": cid, "question": (ev.get("title") or ev.get("question") or "")[:80]}
     except Exception as e:
-        st.error(f"拉取市场失败: {e}")
-        return []
-    if not isinstance(markets, list):
-        return []
-    out = []
-    for m in markets:
-        q = (m.get("question") or "").lower()
-        desc = (m.get("description") or "").lower()
-        text = f"{q} {desc}"
-        if not any(kw.lower() in text for kw in INDEX_KEYWORDS):
-            continue
-        if m.get("closed") is True:
-            continue
-        cid = m.get("conditionId")
-        if cid:
-            out.append({"id": m.get("id"), "conditionId": cid, "question": m.get("question", "")[:80]})
-    return out
+        st.warning(f"拉取 events 时出错（将仅用 markets）: {e}")
+
+    # 策略 2：拉取 markets（不传 closed，以拿到更多结果），按关键词筛选；多页以增加命中率
+    for offset in (0, 500):
+        try:
+            r = requests.get(
+                GAMMA_MARKETS_URL,
+                params={"limit": 500, "offset": offset},
+                timeout=15,
+            )
+            r.raise_for_status()
+            markets = r.json()
+            if not isinstance(markets, list) or not markets:
+                break
+            for m in markets:
+                if not _market_matches_index_keywords(m):
+                    continue
+                cid = m.get("conditionId")
+                if cid and cid not in out_by_cid:
+                    out_by_cid[cid] = {"id": m.get("id"), "conditionId": cid, "question": (m.get("question") or m.get("title") or "")[:80]}
+        except Exception as e:
+            if offset == 0:
+                st.error(f"拉取 markets 失败: {e}")
+            break
+
+    return list(out_by_cid.values())
 
 
 # --- 3. 第二步：提取地址 ---
@@ -195,7 +242,10 @@ if st.session_state.run_scan:
     with st.spinner("第一步：定位 SPX/NDX 活跃市场..."):
         index_markets = fetch_index_markets()
     if not index_markets:
-        st.warning("未找到包含 S&P 500 / Nasdaq / SPX / NDX 的活跃市场，请稍后重试或检查 API。")
+        st.warning(
+            "未找到包含 S&P 500 / Nasdaq / SPX / NDX 相关关键词的市场。"
+            "可能当前暂无此类活跃市场，或 API 暂无返回；请稍后重试或检查网络。"
+        )
         st.stop()
     condition_ids = [m["conditionId"] for m in index_markets]
     st.session_state.spx_ndx_market_ids = condition_ids
