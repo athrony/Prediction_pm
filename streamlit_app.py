@@ -294,12 +294,20 @@ scan_range_label = st.sidebar.radio(
     index=0,
     help="提取该时间范围内在 SPX/NDX 市场有交易的用户地址",
 )
-if st.sidebar.button("🔄 扫描 SPX/NDX 市场并提取交易者"):
-    st.session_state.run_scan = True
-else:
-    st.session_state.run_scan = getattr(st.session_state, "run_scan", False)
 
-if st.session_state.run_scan:
+# 初始化扫描结果缓存
+if "scan_df" not in st.session_state:
+    st.session_state.scan_df = None
+if "scan_fallback" not in st.session_state:
+    st.session_state.scan_fallback = False
+if "scan_market_count" not in st.session_state:
+    st.session_state.scan_market_count = 0
+if "scan_addr_count" not in st.session_state:
+    st.session_state.scan_addr_count = 0
+
+do_scan = st.sidebar.button("🔄 扫描 SPX/NDX 市场并提取交易者")
+
+if do_scan:
     with st.spinner("第一步：定位 SPX/NDX 活跃市场..."):
         index_markets = fetch_index_markets()
     if not index_markets:
@@ -307,10 +315,11 @@ if st.session_state.run_scan:
             "未找到包含 S&P 500 / Nasdaq / SPX / NDX 相关关键词的市场。"
             "可能当前暂无此类活跃市场，或 API 暂无返回；请稍后重试或检查网络。"
         )
+        st.session_state.scan_df = None
         st.stop()
     condition_ids = [m["conditionId"] for m in index_markets]
     st.session_state.spx_ndx_market_ids = condition_ids
-    st.success(f"找到 {len(index_markets)} 个相关市场")
+    st.session_state.scan_market_count = len(index_markets)
 
     delta = SCAN_RANGE_OPTIONS.get(scan_range_label, timedelta(hours=24))
     since_ts = int((datetime.now(timezone.utc) - delta).timestamp())
@@ -318,18 +327,24 @@ if st.session_state.run_scan:
         all_addresses, used_platform_fallback = fetch_trades_for_markets(condition_ids, since_ts)
     if not all_addresses:
         st.warning(f"{scan_range_label}内无交易流水，无法提取地址。请稍后重试。")
+        st.session_state.scan_df = None
         st.stop()
-    st.success(f"去重后得到 {len(all_addresses)} 个地址")
-    if used_platform_fallback:
-        st.info("未在 SPX/NDX 相关市场中找到近期成交，当前展示的是全平台近期活跃交易者。")
+    st.session_state.scan_addr_count = len(all_addresses)
+    st.session_state.scan_fallback = used_platform_fallback
 
     with st.spinner("第三步：批量性能查询与深度评分..."):
         metrics_map = get_address_metrics(list(all_addresses))
     df_traders = build_traders_df(list(all_addresses), metrics_map)
+    st.session_state.scan_df = df_traders
+
+if st.session_state.scan_df is not None:
+    st.success(f"找到 {st.session_state.scan_market_count} 个相关市场 · 去重后得到 {st.session_state.scan_addr_count} 个地址")
+    if st.session_state.scan_fallback:
+        st.info("未在 SPX/NDX 相关市场中找到近期成交，当前展示的是全平台近期活跃交易者。")
 
     st.subheader("🏆 指数交易者列表（可勾选并加入关注）")
     edited = st.data_editor(
-        df_traders,
+        st.session_state.scan_df,
         column_config={
             "选中": st.column_config.CheckboxColumn("选中", default=False),
             "address": st.column_config.TextColumn("地址", width="medium"),
@@ -337,16 +352,20 @@ if st.session_state.run_scan:
         },
         hide_index=True,
         use_container_width=True,
+        key="traders_editor",
     )
     if st.button("➕ 添加到关注"):
         selected = edited[edited["选中"] == True]
         addrs = selected["address"].tolist()
+        added = 0
         for a in addrs:
             if a and a not in st.session_state.watchlist:
                 st.session_state.watchlist.append(a)
-        if addrs:
-            st.success(f"已添加 {len(addrs)} 个地址到关注列表")
-        st.rerun()
+                added += 1
+        if added:
+            st.success(f"已添加 {added} 个地址到关注列表")
+        elif not addrs:
+            st.warning("请先勾选至少一个地址，再点击添加。")
 else:
     st.info("点击左侧「🔄 扫描 SPX/NDX 市场并提取交易者」开始垂直市场扫描。")
 
