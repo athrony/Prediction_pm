@@ -108,33 +108,81 @@ def fetch_index_markets():
 
 
 # --- 3. 第二步：提取地址 ---
+def _normalize_ts(ts):
+    """API 可能返回秒或毫秒，统一为秒"""
+    if not ts:
+        return 0
+    return int(ts) // 1000 if int(ts) > 1e12 else int(ts)
+
+
 def fetch_trades_for_markets(condition_ids, since_ts):
-    """对给定 conditionId 列表请求 /trades，只保留 since_ts 之后的交易，返回去重后的用户地址"""
+    """
+    拉取交易并提取用户地址。优先按 market(conditionId) 拉取；若无结果则拉取全平台近期成交再按 conditionId 过滤；
+    若仍无则返回全平台近期交易地址。
+    返回 (addresses_set, used_platform_fallback: bool)。
+    """
     if not condition_ids:
-        return set()
-    # API 接受逗号分隔的 condition ID
-    market_param = ",".join(condition_ids[:20])  # 单次请求不宜过多
+        return set(), False
+    condition_set = set(condition_ids)
+    addresses = set()
+
+    def parse_trades(trades, filter_by_cid=True):
+        out = set()
+        for t in trades:
+            ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
+            if ts < since_ts:
+                continue
+            if filter_by_cid and (t.get("conditionId") or "").strip() not in condition_set:
+                continue
+            addr = (t.get("proxyWallet") or t.get("user") or t.get("owner") or "").strip()
+            if addr and isinstance(addr, str) and addr.startswith("0x"):
+                out.add(addr)
+        return out
+
+    # 策略 1：按 market 拉取（每次最多 5 个 conditionId，避免 URL 过长）
+    for i in range(0, min(len(condition_ids), 25), 5):
+        chunk = condition_ids[i : i + 5]
+        market_param = ",".join(chunk)
+        try:
+            r = requests.get(
+                DATA_API_TRADES_URL,
+                params={"market": market_param, "limit": 5000},
+                timeout=20,
+            )
+            r.raise_for_status()
+            trades = r.json()
+            if isinstance(trades, list):
+                addresses |= parse_trades(trades, filter_by_cid=True)
+        except Exception:
+            pass
+
+    if addresses:
+        return addresses, False
+
+    # 策略 2：不按 market 拉取，取近期全平台成交再按 conditionId 过滤
     try:
-        r = requests.get(
-            DATA_API_TRADES_URL,
-            params={"market": market_param, "limit": 5000},
-            timeout=20,
-        )
+        r = requests.get(DATA_API_TRADES_URL, params={"limit": 10000}, timeout=25)
         r.raise_for_status()
         trades = r.json()
-    except Exception as e:
-        st.warning(f"拉取交易流水失败: {e}")
-        return set()
-    if not isinstance(trades, list):
-        return set()
-    addresses = set()
-    for t in trades:
-        ts = t.get("timestamp") or t.get("timestampSeconds") or 0
-        if ts >= since_ts:
-            addr = t.get("proxyWallet") or t.get("user") or t.get("owner")
-            if addr and isinstance(addr, str) and addr.startswith("0x"):
-                addresses.add(addr)
-    return addresses
+        if isinstance(trades, list):
+            addresses = parse_trades(trades, filter_by_cid=True)
+    except Exception:
+        pass
+
+    if addresses:
+        return addresses, False
+
+    # 策略 3：仍无则用全平台近期交易地址（不按 conditionId 过滤）
+    try:
+        r = requests.get(DATA_API_TRADES_URL, params={"limit": 10000}, timeout=25)
+        r.raise_for_status()
+        trades = r.json()
+        if isinstance(trades, list):
+            addresses = parse_trades(trades, filter_by_cid=False)
+    except Exception:
+        pass
+
+    return addresses, True
 
 
 # --- 4. 第三步：深度评分（你的公式）---
@@ -267,11 +315,13 @@ if st.session_state.run_scan:
     delta = SCAN_RANGE_OPTIONS.get(scan_range_label, timedelta(hours=24))
     since_ts = int((datetime.now(timezone.utc) - delta).timestamp())
     with st.spinner(f"第二步：提取{scan_range_label}交易用户地址..."):
-        all_addresses = fetch_trades_for_markets(condition_ids, since_ts)
+        all_addresses, used_platform_fallback = fetch_trades_for_markets(condition_ids, since_ts)
     if not all_addresses:
-        st.warning(f"{scan_range_label}内无交易流水，无法提取地址。")
+        st.warning(f"{scan_range_label}内无交易流水，无法提取地址。请稍后重试。")
         st.stop()
     st.success(f"去重后得到 {len(all_addresses)} 个地址")
+    if used_platform_fallback:
+        st.info("未在 SPX/NDX 相关市场中找到近期成交，当前展示的是全平台近期活跃交易者。")
 
     with st.spinner("第三步：批量性能查询与深度评分..."):
         metrics_map = get_address_metrics(list(all_addresses))
