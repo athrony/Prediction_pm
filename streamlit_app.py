@@ -241,41 +241,53 @@ def build_traders_df(addresses, metrics_map):
     return pd.DataFrame(rows).sort_values("Score", ascending=False)
 
 
+def _trade_is_index_related(t):
+    """判断一笔成交是否与 SPX/NDX 指数相关（按标题/slug 匹配关键词）"""
+    title = (t.get("title") or t.get("slug") or "").lower()
+    return any(kw in title for kw in INDEX_KEYWORDS)
+
+
 def fetch_recent_trades_for_watchlist(watchlist_addresses, condition_ids, since_ts):
-    """拉取 watchlist 中用户在 SPX/NDX 市场（condition_ids）的近期交易"""
-    if not watchlist_addresses or not condition_ids:
+    """
+    拉取 watchlist 中每个用户最近 24 小时内与 SPX/NDX 相关的下注。
+    策略：逐用户请求 /trades?user=addr，在客户端按关键词和 conditionId 两种方式判断是否属于 SPX/NDX。
+    """
+    if not watchlist_addresses:
         return []
-    market_param = ",".join(condition_ids[:15])
-    try:
-        r = requests.get(
-            DATA_API_TRADES_URL,
-            params={"market": market_param, "limit": 500},
-            timeout=15,
-        )
-        r.raise_for_status()
-        trades = r.json()
-    except Exception:
-        return []
-    watch_set = set(w.lower() for w in watchlist_addresses)
+    condition_set = set(condition_ids) if condition_ids else set()
     out = []
-    for t in trades:
-        ts = t.get("timestamp") or t.get("timestampSeconds") or 0
-        if ts < since_ts:
+    for addr in watchlist_addresses:
+        try:
+            r = requests.get(
+                DATA_API_TRADES_URL,
+                params={"user": addr, "limit": 200},
+                timeout=15,
+            )
+            r.raise_for_status()
+            trades = r.json()
+        except Exception:
             continue
-        addr = (t.get("proxyWallet") or t.get("user") or "").strip()
-        if not addr or addr.lower() not in watch_set:
+        if not isinstance(trades, list):
             continue
-        out.append({
-            "timestamp": ts,
-            "address": addr,
-            "side": t.get("side", ""),
-            "title": t.get("title") or t.get("slug") or "",
-            "outcome": t.get("outcome", ""),
-            "price": t.get("price"),
-            "size": t.get("size"),
-        })
+        for t in trades:
+            ts = _normalize_ts(t.get("timestamp") or t.get("timestampSeconds"))
+            if ts < since_ts:
+                continue
+            cid = (t.get("conditionId") or "").strip()
+            is_index = (cid in condition_set) or _trade_is_index_related(t)
+            if not is_index:
+                continue
+            out.append({
+                "timestamp": ts,
+                "address": addr,
+                "side": t.get("side", ""),
+                "title": t.get("title") or t.get("slug") or "",
+                "outcome": t.get("outcome", ""),
+                "price": t.get("price"),
+                "size": t.get("size"),
+            })
     out.sort(key=lambda x: x["timestamp"], reverse=True)
-    return out[:50]
+    return out[:100]
 
 
 # 扫描时间范围选项（用于第二步提取交易地址）
@@ -381,18 +393,45 @@ if st.session_state.watchlist:
         st.session_state.watchlist = []
         st.rerun()
 
-    if st.button("🔄 刷新实时动态"):
+    if st.button("🔄 刷新 SPX/NDX 下注记录"):
+        st.session_state.watchlist_trades = None
         st.rerun()
-    st.caption("仅展示关注列表中用户在 SPX/NDX 市场的新订单（基于最近一次拉取）")
-    cids = getattr(st.session_state, "spx_ndx_market_ids", []) or []
-    poll_ts = int((datetime.now(timezone.utc) - timedelta(minutes=5)).timestamp())
-    recent = fetch_recent_trades_for_watchlist(st.session_state.watchlist, cids, poll_ts)
+
+    st.caption("展示关注列表中用户最近 24 小时内在 SPX/NDX 相关市场的下注记录")
+    cids = st.session_state.get("spx_ndx_market_ids") or []
+    since_24h = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
+
+    if "watchlist_trades" not in st.session_state or st.session_state.watchlist_trades is None:
+        with st.spinner("正在查询关注用户的 SPX/NDX 下注记录..."):
+            st.session_state.watchlist_trades = fetch_recent_trades_for_watchlist(
+                st.session_state.watchlist, cids, since_24h
+            )
+
+    recent = st.session_state.watchlist_trades
     if recent:
+        trades_data = []
         for t in recent:
             ts_str = datetime.fromtimestamp(t["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            profile_link = f"[{t['address'][:10]}...]({PROFILE_BASE}{t['address']})"
-            st.markdown(f"- **{ts_str}** — {profile_link} — {t.get('side', '')} — {t.get('title', '')[:50]} — {t.get('outcome', '')}")
+            trades_data.append({
+                "时间": ts_str,
+                "地址": t["address"],
+                "方向": t.get("side", ""),
+                "市场": (t.get("title") or "")[:60],
+                "结果": t.get("outcome", ""),
+                "价格": t.get("price"),
+                "数量": t.get("size"),
+                "Profile": f"{PROFILE_BASE}{t['address']}",
+            })
+        df_trades = pd.DataFrame(trades_data)
+        st.dataframe(
+            df_trades,
+            column_config={
+                "Profile": st.column_config.LinkColumn("Profile", display_text="查看"),
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
     else:
-        st.info("暂无 watchlist 用户在 SPX/NDX 市场的新订单；请稍后刷新页面重试。")
+        st.info("关注用户在最近 24 小时内无 SPX/NDX 相关下注记录。请稍后刷新重试。")
 else:
     st.info("关注列表为空。请先完成上方扫描并勾选地址后点击「添加到关注」。")
